@@ -5,8 +5,8 @@ from gigica._algorithm import gig_ica_fit_rust, _gig_ica_fit_python
 
 def test_speedup():
     # Generate synthetic data
-    n_samples = 100
-    n_features = 1000
+    n_samples = 1000
+    n_features = 10000
     n_components = 50
 
     X, references, _, _ = generate_synthetic_data(n_samples, n_features, n_components)
