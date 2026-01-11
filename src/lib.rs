@@ -1,6 +1,6 @@
-use faer::{Mat, MatRef};
-use ndarray::{Array1, Array2, Axis};
-use numpy::{PyReadonlyArray2, ToPyArray};
+use faer::stats::NanHandling;
+use faer::{stats, Col, Mat, MatMut, MatRef};
+use numpy::{PyArray2, PyArrayMethods, PyReadonlyArray2, PyUntypedArrayMethods};
 use pyo3::prelude::*;
 
 #[pyfunction]
@@ -14,107 +14,179 @@ fn gig_ica_fit<'py>(
     max_iter: usize,
     tol: f64,
 ) -> PyResult<Bound<'py, PyAny>> {
-    let x_arr = x.as_array();
-    let references_arr = references.as_array();
+    // Convert inputs to faer Matrices
+    // Data is usually (n_samples, n_features) => (n_time, n_voxel)
+    let n_samples = x.shape()[0];
+    let n_features = x.shape()[1];
 
-    let n_samples = x_arr.shape()[0];
-    let n_features = x_arr.shape()[1];
-    let n_components = references_arr.shape()[0];
+    let mut mat_x_centered = array_to_mat(x.as_array());
 
     // 1. Center Data
-    let x_mean = x_arr.mean_axis(Axis(1)).unwrap();
-    let mut x_centered = x_arr.to_owned();
-    for i in 0..n_samples {
-        let m = x_mean[i];
-        for j in 0..n_features {
-            x_centered[[i, j]] -= m;
+    // Calculate row means using faer::stats
+    // We want mean of each row (collapsing columns) -> Result is Col vector (n_samples, 1).
+    let mut row_means = Col::<f64>::zeros(n_samples);
+    stats::col_mean(
+        row_means.as_mut(),
+        mat_x_centered.as_ref(),
+        NanHandling::Propagate,
+    );
+
+    // Subtract row means
+    // There isn't a direct broadcasting "sub_col" in faer yet for in-place modification of Mat by Col?
+    // We can iterate, but let's check if we can improve this loop too.
+    for r in 0..n_samples {
+        let m = row_means[r];
+        for c in 0..n_features {
+            mat_x_centered[(r, c)] -= m;
         }
     }
 
     // 2. Whitening
     let rank = n_samples.min(n_features);
-    let mat_x_centered = array_to_mat(x_centered.view());
 
     let (mat_white_owned, n_samples_eff) = if whiten {
         let svd_x = mat_x_centered.thin_svd().unwrap();
-        let s_diag = svd_x.S();
+        let s_diag = svd_x.S(); // Diagonal singular values
         let u = svd_x.U();
 
         let sqrt_n = (n_features as f64).sqrt();
         let mut k_mat = Mat::<f64>::zeros(n_samples, rank);
 
+        // Accessing diagonal S
         for i in 0..rank {
             let val = s_diag[i];
             let inv_s = if val > 1e-12 { 1.0 / val } else { 0.0 };
-            let scale = inv_s * sqrt_n;
+            let scale_val = inv_s * sqrt_n;
+
+            // k_mat[:, i] = u[:, i] * scale
             for r in 0..n_samples {
-                k_mat[(r, i)] = u[(r, i)] * scale;
+                k_mat[(r, i)] = u[(r, i)] * scale_val;
             }
         }
 
-        let mat_white = k_mat.transpose() * &mat_x_centered; // (rank, n_features)
+        // mat_white = k_mat.T * mat_x_centered
+        // (rank, n_samples) * (n_samples, n_features) -> (rank, n_features)
+        let mat_white = k_mat.transpose() * &mat_x_centered;
         (mat_white, rank)
     } else {
-        (mat_x_centered.clone(), n_samples)
+        (mat_x_centered, n_samples)
     };
 
-    let mat_x_white = mat_white_owned.as_ref();
+    let mat_x_white = mat_white_owned.as_ref(); // (n_samples_eff, n_features)
 
     // Precompute Pseudo-Inverse of X_white using Faer SVD
     // pinv(X_white) = V * S^-1 * U^T
     let svd_xw = mat_x_white.thin_svd().unwrap();
     let s_xw = svd_xw.S();
     let u_xw = svd_xw.U();
-    let v_xw = svd_xw.V();
+    let v_xw = svd_xw.V(); // V matrix
 
     let min_dim = n_samples_eff.min(n_features);
+
+    // Compute S^-1 * U^T
+    // S_inv is diagonal. U^T is (min_dim, n_samples_eff).
+    // Result is (min_dim, n_samples_eff).
     let mut s_inv_u_t = Mat::<f64>::zeros(min_dim, n_samples_eff);
 
     for i in 0..min_dim {
         let val = s_xw[i];
         let inv_val = if val > 1e-12 { 1.0 / val } else { 0.0 };
         for r in 0..n_samples_eff {
+            // (S^-1 * U^T)[i, r] = (1/s[i]) * U[r, i]
             s_inv_u_t[(i, r)] = u_xw[(r, i)] * inv_val;
         }
     }
 
-    let mat_pinv = v_xw * s_inv_u_t;
-
-    let mut components = Array2::<f64>::zeros((n_components, n_features));
+    // pinv = V * (S^-1 * U^T)
+    let mat_pinv = v_xw * s_inv_u_t; // (n_features, n_samples_eff)
 
     let e_g_v = 0.3745672075;
 
+    // Precompute stats for references
+    // mat_references is (n_components, n_features).
+    // We want stats for each row (component).
+    let n_components = references.shape()[0];
+    let mat_references = array_to_mat(references.as_array());
+    let mut ref_means = Col::<f64>::zeros(n_components);
+    stats::col_mean(
+        ref_means.as_mut(),
+        mat_references.as_ref(),
+        NanHandling::Propagate,
+    );
+
+    let mut components = Mat::<f64>::zeros(n_components, n_features);
     for k in 0..n_components {
-        let ref_row = references_arr.row(k);
-        let ref_mean = ref_row.mean().unwrap();
-        let ref_std = ref_row.std(1.0);
-        let ref_norm = if ref_std > 1e-15 {
-            (&ref_row - ref_mean) / ref_std
+        let ref_row = mat_references.row(k); // RowRef
+        let ref_mean = ref_means[k];
+
+        // Calculate std manually or using faer vector ops if possible
+        // sum((x - mean)^2) / N
+        // Can we do this with faer?
+        // (ref_row - ref_mean).norm_l2()^2 / N ?
+        // ref_row is RowRef.
+        // We can't subtract scalar from RowRef directly in all versions.
+
+        // Let's rely on standard loop for variance for now to avoid compilation errors on "tensor" ops
+        // unless we convert to Col and use norm.
+        let mut sq_sum = 0.0;
+        for c in 0..n_features {
+            let diff = ref_row[c] - ref_mean;
+            sq_sum += diff * diff;
+        }
+        let ref_var = sq_sum / (n_features as f64);
+        let ref_std = if ref_var > 0.0 { ref_var.sqrt() } else { 0.0 };
+
+        // Normalize reference
+        let mut ref_norm = Col::<f64>::zeros(n_features);
+
+        if ref_std > 1e-15 {
+            for c in 0..n_features {
+                ref_norm[c] = (ref_row[c] - ref_mean) / ref_std;
+            }
         } else {
-            ref_row.to_owned()
-        };
+            for c in 0..n_features {
+                ref_norm[c] = ref_row[c];
+            }
+        }
 
-        // ref_norm as Mat
-        let mat_ref_norm =
-            MatRef::from_column_major_slice(ref_norm.as_slice().unwrap(), n_features, 1);
-        let mat_x_ref = mat_x_white * mat_ref_norm;
+        // mat_x_ref = mat_x_white * mat_ref_norm
+        // (n_samples_eff, n_features) * (n_features, 1) -> (n_samples_eff, 1)
+        let mat_x_ref = mat_x_white * &ref_norm;
 
-        let mat_ref = Mat::from_fn(n_features, 1, |r, _| ref_norm[r]);
-        let w_init_mat_res = mat_pinv.transpose() * &mat_ref;
+        // w_init = pinv.T * ref_norm (approx, code said ref_norm as mat)
+        let w_init = mat_pinv.transpose() * &ref_norm;
 
-        let mut w = Array1::from_shape_fn(n_samples_eff, |i| w_init_mat_res[(i, 0)]);
-        let w_norm = w.mapv(|a| a * a).sum().sqrt();
-        w /= w_norm;
+        let mut w = w_init.clone();
+
+        // normalize w
+        let mut w_norm_sq: f64 = 0.0;
+        for i in 0..n_samples_eff {
+            w_norm_sq += w[i] * w[i];
+        }
+        let w_norm = w_norm_sq.sqrt();
+
+        // scale w
+        for i in 0..n_samples_eff {
+            w[i] /= w_norm;
+        }
 
         // y_est = mat_x_white.T * w
-        let mat_w = MatRef::from_column_major_slice(w.as_slice().unwrap(), n_samples_eff, 1);
-        let mat_y_est = mat_x_white.transpose() * mat_w;
-        let mut y_est = Array1::from_vec(mat_y_est.col_as_slice(0).to_vec());
+        let mut y_est = mat_x_white.transpose() * &w;
 
-        let e_gy = y_est.mapv(|v| log_cosh(v)).mean().unwrap();
+        // Calculate neg_j
+        let mut e_gy_sum = 0.0;
+        for i in 0..n_features {
+            e_gy_sum += log_cosh(y_est[i]);
+        }
+        let e_gy = e_gy_sum / (n_features as f64);
         let neg_j = (e_gy - e_g_v).powi(2);
 
-        let val_f = (&y_est * &ref_norm).mean().unwrap();
+        // val_f = mean(y_est * ref_norm)
+        let mut dot_prod = 0.0;
+        for i in 0..n_features {
+            dot_prod += y_est[i] * ref_norm[i];
+        }
+        let val_f = dot_prod / (n_features as f64);
 
         let initial_f_clamped = val_f.max(0.0).min(0.999);
         let ci = if neg_j > 1e-15 {
@@ -124,46 +196,45 @@ fn gig_ica_fit<'py>(
         };
 
         let mut converged = false;
+
         for _iter in 0..max_iter {
             let w_old = w.clone();
 
-            // Forward pass
-            let mat_w = MatRef::from_column_major_slice(w.as_slice().unwrap(), n_samples_eff, 1);
-            let mat_y_est = mat_x_white.transpose() * mat_w;
-            // Map back to Array for element-wise ops
-            // y_est needs to be updated!
-            y_est = Array1::from_vec(mat_y_est.col_as_slice(0).to_vec());
+            y_est = mat_x_white.transpose() * &w;
 
-            let gy_tanh = y_est.mapv(|v| v.tanh());
-            let e_gy = y_est.mapv(|v| log_cosh(v)).mean().unwrap();
-
+            // gy_tanh
+            let mut gy_tanh = Col::<f64>::zeros(n_features);
+            let mut e_gy_sum = 0.0;
+            for i in 0..n_features {
+                let v = y_est[i];
+                gy_tanh[i] = v.tanh();
+                e_gy_sum += log_cosh(v);
+            }
+            let e_gy = e_gy_sum / (n_features as f64);
             let gamma = e_gy - e_g_v;
-            let val_j = gamma.powi(2);
+            let val_j = gamma * gamma;
 
-            // x_gy = x_white * gy_tanh
-            let mat_gy_tanh =
-                MatRef::from_column_major_slice(gy_tanh.as_slice().unwrap(), n_features, 1);
-            let mat_x_gy = mat_x_white * mat_gy_tanh;
-            // Convert to Array
-            let x_gy_arr = Array1::from_vec(mat_x_gy.col_as_slice(0).to_vec());
+            // mat_x_gy = mat_x_white * gy_tanh
+            let x_gy = mat_x_white * &gy_tanh;
 
-            let grad_j = &x_gy_arr * (2.0 * gamma / (n_features as f64));
-
+            let gj_scale = 2.0 * gamma / (n_features as f64);
             let dk_dj = (2.0 / std::f64::consts::PI) * ci / (1.0 + (ci * val_j).powi(2));
-            let grad_k = &grad_j * dk_dj;
 
-            // grad_f = x_white * ref_norm
-            let grad_f = Array1::from_vec(mat_x_ref.col_as_slice(0).to_vec()) / (n_features as f64);
+            let coeff_gy = (gj_scale * dk_dj) * alpha;
+            let coeff_ref = (1.0 - alpha) / (n_features as f64);
 
-            let grad_c = grad_k * alpha + grad_f * (1.0 - alpha);
+            // grad_c = x_gy * coeff_gy + mat_x_ref * coeff_ref
+            let grad_c = x_gy * coeff_gy + &mat_x_ref * coeff_ref;
 
-            let grad_norm = grad_c.mapv(|v| v.powi(2)).sum().sqrt();
+            let grad_norm = grad_c.norm_l2();
             if grad_norm < 1e-15 {
                 converged = true;
                 break;
             }
-            let direction = &grad_c / grad_norm;
 
+            let direction = grad_c * (1.0 / grad_norm);
+
+            // Line Search
             let mut mu = 1.0;
             let rho = 0.5;
             let beta = 0.02;
@@ -175,20 +246,25 @@ fn gig_ica_fit<'py>(
             let mut improved = false;
 
             for _ls in 0..10 {
+                // w_try_un = w + direction * mu
                 let w_try_un = &w + &direction * mu;
-                let w_try_norm = w_try_un.mapv(|v| v * v).sum().sqrt();
-                let w_try = w_try_un / w_try_norm;
+                let w_try_norm = w_try_un.norm_l2();
+                let w_try = w_try_un * (1.0 / w_try_norm);
 
-                // y_try = x_white.t * w_try
-                let mat_w_try =
-                    MatRef::from_column_major_slice(w_try.as_slice().unwrap(), n_samples_eff, 1);
-                let mat_y_try = mat_x_white.transpose() * mat_w_try;
-                let y_try_arr = Array1::from_vec(mat_y_try.col_as_slice(0).to_vec()); // Avoid overwriting y_try variable name confusion
+                let y_try = mat_x_white.transpose() * &w_try; // (n_features, 1)
 
-                let gamma_try = y_try_arr.mapv(|v| log_cosh(v)).mean().unwrap() - e_g_v;
-                let j_try = gamma_try.powi(2);
+                let mut scan_e_gy = 0.0;
+                let mut scan_dot = 0.0;
+                for i in 0..n_features {
+                    let v = y_try[i];
+                    scan_e_gy += log_cosh(v);
+                    scan_dot += v * ref_norm[i];
+                }
+
+                let gamma_try = (scan_e_gy / (n_features as f64)) - e_g_v;
+                let j_try = gamma_try * gamma_try;
                 let k_try = (2.0 / std::f64::consts::PI) * (ci * j_try).atan();
-                let f_try = (&y_try_arr * &ref_norm).mean().unwrap();
+                let f_try = scan_dot / (n_features as f64);
                 let c_try = alpha * k_try + (1.0 - alpha) * f_try;
 
                 if c_try > c_current + beta * mu * grad_norm {
@@ -204,8 +280,8 @@ fn gig_ica_fit<'py>(
                 w = w_new;
             }
 
-            let dot = w.dot(&w_old).abs();
-            if 1.0 - dot < tol {
+            let dot = w.transpose() * &w_old;
+            if 1.0 - dot.abs() < tol {
                 converged = true;
                 break;
             }
@@ -223,17 +299,31 @@ fn gig_ica_fit<'py>(
             }
         }
 
-        // y_final = x_white.t().dot(&w);
-        // Reuse Faer logic
-        let mat_w = MatRef::from_column_major_slice(w.as_slice().unwrap(), n_samples_eff, 1);
-        let mat_y_final = mat_x_white.transpose() * mat_w;
-
+        // Save component
+        let y_final = mat_x_white.transpose() * &w;
         for j in 0..n_features {
-            components[[k, j]] = mat_y_final[(j, 0)];
+            components[(k, j)] = y_final[j];
         }
     }
 
-    Ok(components.to_pyarray(py).into_any())
+    // Create output Python array directly (C-order)
+    let output = PyArray2::zeros(py, (n_components, n_features), false);
+
+    // Get mutable ndarray view
+    // We need to use `try_readwrite` or `readwrite`
+    let mut out_view = output.readwrite();
+    let mut out_array = out_view.as_array_mut();
+
+    // Optimize copy using faer slice methods
+    // out_array is C-order (Row-Major) and contiguous.
+    let slice = out_array
+        .as_slice_mut()
+        .expect("Output array must be contiguous");
+
+    let mut target = MatMut::from_row_major_slice_mut(slice, n_components, n_features);
+    target.copy_from(&components);
+
+    Ok(output.into_any())
 }
 
 fn log_cosh(x: f64) -> f64 {
@@ -247,18 +337,8 @@ fn log_cosh(x: f64) -> f64 {
 
 fn array_to_mat(arr: ndarray::ArrayView2<f64>) -> Mat<f64> {
     let (rows, cols) = arr.dim();
-    if let Some(slice) = arr.as_slice() {
-        // Array2 is Row-Major. MatExpects Col-Major.
-        // Slice represents A(rows, cols) row-major.
-        // Equivalent to B(cols, rows) col-major where B = A.T.
-        // So we create MatRef(cols, rows) wrapping slice, then transpose.
-        use faer::MatRef;
-        MatRef::from_column_major_slice(slice, cols, rows)
-            .transpose()
-            .to_owned()
-    } else {
-        Mat::from_fn(rows, cols, |r, c| arr[[r, c]])
-    }
+    let slice = arr.as_slice().unwrap();
+    MatRef::from_row_major_slice(slice, rows, cols).to_owned()
 }
 
 #[pymodule]
