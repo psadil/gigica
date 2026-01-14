@@ -71,7 +71,15 @@ def gig_ica_fit(
     """
     if gig_ica_fit_rust is not None:
         try:
-            return gig_ica_fit_rust(X, references, alpha, whiten, max_iter, tol)
+            # rust implementation expects things in C order
+            return gig_ica_fit_rust(
+                np.asarray(X, order="C"),
+                np.asarray(references, order="C"),
+                alpha,
+                whiten,
+                max_iter,
+                tol,
+            )
         except Exception as e:
             logging.warning(
                 f"failed during rust implementation {e}. Trying with python..."
